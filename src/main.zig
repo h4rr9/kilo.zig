@@ -1,24 +1,62 @@
 const std = @import("std");
+const os = std.os;
+const fs = std.fs;
+
+const Termios = struct {
+    tty: *fs.File,
+    termios: os.termios,
+
+    pub fn init(tty: *fs.File) !Termios {
+        return .{ .tty = tty, .termios = try os.tcgetattr(tty.handle) };
+    }
+
+    fn enableRawMode(self: *Termios) !void {
+        var raw = self.termios;
+
+        raw.iflag &= ~@as(os.system.tcflag_t, os.system.BRKINT | os.system.ICRNL | os.system.INPCK | os.system.ISTRIP | os.system.IXON);
+        raw.oflag &= ~@as(os.system.tcflag_t, os.system.OPOST);
+        raw.cflag &= ~@as(os.system.tcflag_t, os.system.CS8);
+        raw.lflag &= ~@as(os.system.tcflag_t, os.system.ECHO | os.system.ICANON | os.system.IEXTEN | os.system.ISIG);
+        raw.cc[os.system.V.MIN] = 0;
+        raw.cc[os.system.V.TIME] = 1;
+
+        try os.tcsetattr(self.tty.handle, .FLUSH, raw);
+    }
+
+    fn disableRawMode(self: *Termios) !void {
+        try os.tcsetattr(self.tty.handle, .FLUSH, self.termios);
+    }
+};
 
 pub fn main() !void {
-    // Prints to stderr (it's a shortcut based on `std.io.getStdErr()`)
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+    var tty = try fs.openFileAbsolute("/dev/tty", .{ .mode = .read_write });
+    defer tty.close();
 
-    // stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    const stdout_file = std.io.getStdOut().writer();
-    var bw = std.io.bufferedWriter(stdout_file);
-    const stdout = bw.writer();
+    var termios = try Termios.init(&tty);
 
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
+    // disable raw mode on exit
+    defer termios.disableRawMode() catch @panic("Unable to reset termios.");
 
-    try bw.flush(); // don't forget to flush!
-}
+    // enable raw mode
+    try termios.enableRawMode();
 
-test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+    var stdin = std.io.getStdIn();
+    var stdin_reader = stdin.reader().any();
+    var stdin_writer = stdin.writer();
+
+    var buffer: [1]u8 = .{0};
+
+    while (true) {
+        buffer[0] = 0;
+        _ = try stdin_reader.read(&buffer);
+        const c = buffer[0];
+
+        if (std.ascii.isControl(c)) {
+            try stdin_writer.print("{d}\r\n", .{c});
+        } else {
+            try stdin_writer.print("{d} ('{c}')\r\n", .{ c, c });
+        }
+
+        if (c == 'q') break;
+    }
 }
