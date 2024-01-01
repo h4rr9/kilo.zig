@@ -4,6 +4,7 @@ const fs = std.fs;
 const root = @import("root.zig");
 
 pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     var stdout = std.io.getStdOut();
     var stdin = std.io.getStdIn();
 
@@ -21,16 +22,15 @@ pub fn main() !void {
     // init screen
     const screen = try termios.getWindowSize();
 
-    var editor = root.kilo(stdout_writer, stdin_reader, screen);
+    var editor = root.kilo(stdout_writer, stdin_reader, screen, gpa.allocator());
 
     while (true) {
+        try editor.refreshScreen();
         switch (try editor.processKeyPress()) {
             .CtrlQPressed => {
-                try editor.refreshScreen();
                 break;
             },
-            else => {},
+            else => std.atomic.spinLoopHint(),
         }
-        try editor.refreshScreen();
     }
 }

@@ -2,9 +2,29 @@ const std = @import("std");
 const os = std.os;
 const fs = std.fs;
 
+const KILO_VERSION = "0.0.1";
+
 const KeyResult = enum {
     CtrlQPressed,
     Default,
+};
+
+const EditorKey = enum {
+    ARROW_LEFT,
+    ARROW_RIGHT,
+    ARROW_UP,
+    ARROW_DOWN,
+    HOME_KEY,
+    END_KEY,
+    DEL_KEY,
+    PAGE_UP,
+    PAGE_DOWN,
+};
+
+const Key = union(enum) {
+    key: u8,
+    editor_key: EditorKey,
+    exit,
 };
 
 const Screen = struct { row: u16, col: u16 };
@@ -67,10 +87,10 @@ pub fn Termios(comptime WriterType: anytype) type {
 
             var buf: [32]u8 = undefined;
             var buffered_stream = std.io.fixedBufferStream(&buf);
-            try self.reader.skipBytes(2, .{});
+            // try self.reader.skipBytes(2, .{});
             try self.reader.streamUntilDelimiter(buffered_stream.writer(), 'R', null);
 
-            // if (buf[0] != '\x1b' or buf[1] != '[') return error.UnexpectedScreenDimFormat;
+            if (buf[0] != '\x1b' or buf[1] != '[') return error.UnexpectedScreenDimFormat;
 
             var parts = std.mem.splitScalar(u8, buf[0..try buffered_stream.getPos()], ';');
 
@@ -89,58 +109,172 @@ pub fn termios(stdin: *fs.File, stdout: *fs.File, writer: anytype, reader: std.i
 pub fn kilo(
     writer: anytype,
     reader: std.io.AnyReader,
-    screen_size: Screen,
+    screen: Screen,
+    alloc: std.mem.Allocator,
 ) Editor(@TypeOf(writer)) {
-    return .{ .writer = writer, .reader = reader, .screen_size = screen_size };
+    return .{ .writer = writer, .reader = reader, .screen = screen, .alloc = alloc };
 }
 
 pub fn Editor(comptime WriterType: anytype) type {
     return struct {
         writer: WriterType,
         reader: std.io.AnyReader,
-        screen_size: Screen,
-        buffer: [1]u8 = .{0},
+        alloc: std.mem.Allocator,
 
-        pub fn readKey(self: *@This()) !u8 {
-            self.buffer[0] = 0;
-            _ = try self.reader.read(self.buffer[0..1]);
-            const c = self.buffer[0];
+        screen: Screen,
+        cursor: Screen = .{ .row = 0, .col = 0 },
 
-            if (c != 0) {
-                if (std.ascii.isControl(c)) {
-                    try self.writer.print("{d}\r\n", .{c});
-                } else {
-                    try self.writer.print("{d} ('{c}')\r\n", .{ c, c });
-                }
+        pub fn readKey(self: *@This()) !Key {
+            var buffer: [1]u8 = undefined;
+            var seq: [3]u8 = undefined;
+            while (try self.reader.read(&buffer) != 1) std.atomic.spinLoopHint();
+            const c: u8 = buffer[0];
+
+            if (c == std.ascii.control_code.xon) return .exit;
+
+            if (c == '\x1b') {
+                _ = self.reader.read(seq[0..1]) catch return .{ .key = c };
+                _ = self.reader.read(seq[1..2]) catch return .{ .key = c };
+
+                if (seq[0] == '[')
+                    if (seq[1] >= '0' and seq[1] <= '9') {
+                        _ = self.reader.read(seq[2..3]) catch return .{ .key = c };
+                        if (seq[2] == '~')
+                            return switch (seq[1]) {
+                                '1', '7' => .{ .editor_key = .HOME_KEY },
+                                '4', '8' => .{ .editor_key = .END_KEY },
+                                '3' => .{ .editor_key = .DEL_KEY },
+                                '5' => .{ .editor_key = .PAGE_UP },
+                                '6' => .{ .editor_key = .PAGE_DOWN },
+                                else => .{ .key = c },
+                            };
+                    } else return switch (seq[1]) {
+                        'A' => .{ .editor_key = .ARROW_UP },
+                        'B' => .{ .editor_key = .ARROW_DOWN },
+                        'C' => .{ .editor_key = .ARROW_RIGHT },
+                        'D' => .{ .editor_key = .ARROW_LEFT },
+                        'H' => .{ .editor_key = .HOME_KEY },
+                        'F' => .{ .editor_key = .END_KEY },
+                        else => .{ .key = c },
+                    }
+                else if (seq[0] == 'O')
+                    return switch (seq[1]) {
+                        'H' => .{ .editor_key = .HOME_KEY },
+                        'F' => .{ .editor_key = .END_KEY },
+                        else => .{ .key = c },
+                    };
             }
-
-            return c;
+            return .{ .key = c };
         }
 
         pub fn processKeyPress(self: *@This()) !KeyResult {
             switch (try self.readKey()) {
-                std.ascii.control_code.xon => return .CtrlQPressed,
-                else => return .Default,
+                .exit => {
+                    _ = try self.writer.write("\x1b[2J");
+                    _ = try self.writer.write("\x1b[H");
+
+                    return .CtrlQPressed;
+                },
+                .editor_key => |c| switch (c) {
+                    .ARROW_UP, .ARROW_DOWN, .ARROW_LEFT, .ARROW_RIGHT => |a_key| self.moveCursor(a_key),
+                    .PAGE_UP, .PAGE_DOWN => |p_key| {
+                        var times: u16 = 0;
+                        const key: EditorKey = if (p_key == .PAGE_UP) .ARROW_UP else .ARROW_DOWN;
+                        while (times < self.screen.row) : (times += 1)
+                            self.moveCursor(key);
+                    },
+                    .HOME_KEY => self.cursor.col = 0,
+                    .END_KEY => self.cursor.col = self.screen.col - 1,
+                    else => {},
+                },
+                else => {},
             }
+
+            return .Default;
         }
 
         pub fn refreshScreen(self: *@This()) !void {
-            _ = try self.writer.write("\x1b[2J");
-            _ = try self.writer.write("\x1b[H");
+            var abuf: Abuf = .{ .b = try self.alloc.alloc(u8, 0) };
+            defer self.alloc.free(abuf.b);
 
-            try self.drawRows();
+            // hide cursor
+            try abuf.abAppend("\x1b[?25l", self.alloc);
+            // move cursor to top left
+            try abuf.abAppend("\x1b[H", self.alloc);
 
-            _ = try self.writer.write("\x1b[H");
+            try self.drawRows(&abuf);
+
+            // put cursor at position
+            const slice = try std.fmt.allocPrint(self.alloc, "\x1b[{d};{d}H", .{ self.cursor.row + 1, self.cursor.col + 1 });
+            defer self.alloc.free(slice);
+            try abuf.abAppend(slice, self.alloc);
+
+            // show cursor
+            try abuf.abAppend("\x1b[?25h", self.alloc);
+
+            _ = try self.writer.write(abuf.b);
         }
 
-        pub fn drawRows(self: *@This()) !void {
-            for (0..self.screen_size.row) |y| {
-                _ = try self.writer.write("~");
+        pub fn drawRows(self: *@This(), abuf: *Abuf) !void {
+            const banner = try std.fmt.allocPrint(self.alloc, "Kilo editor -- version {s}", .{KILO_VERSION});
+            defer self.alloc.free(banner);
 
-                if (y < self.screen_size.row - 1) {
-                    _ = try self.writer.write("\r\n");
+            for (0..self.screen.row) |y| {
+                if (y == self.screen.row / 3) {
+                    const banner_len = @min(banner.len, self.screen.col);
+
+                    const padding = (self.screen.col - banner_len) / 2;
+
+                    var i: u32 = 0;
+                    while (i < padding) : (i += 1) {
+                        try if (i == 0)
+                            abuf.abAppend("~", self.alloc)
+                        else
+                            abuf.abAppend(" ", self.alloc);
+                    }
+
+                    try abuf.abAppend(banner[0..banner_len], self.alloc);
+                } else try abuf.abAppend("~", self.alloc);
+
+                // eraze part of current line
+                try abuf.abAppend("\x1b[K", self.alloc);
+
+                if (y < self.screen.row - 1) {
+                    try abuf.abAppend("\r\n", self.alloc);
                 }
+            }
+        }
+
+        pub fn moveCursor(self: *@This(), key: EditorKey) void {
+            switch (key) {
+                .ARROW_LEFT => self.cursor.col -|= 1,
+                .ARROW_RIGHT => if (self.cursor.col != self.screen.col - 1) {
+                    self.cursor.col += 1;
+                },
+                .ARROW_UP => self.cursor.row -|= 1,
+                .ARROW_DOWN => if (self.cursor.row != self.screen.row - 1) {
+                    self.cursor.row += 1;
+                },
+                else => unreachable,
             }
         }
     };
 }
+
+const Abuf = struct {
+    b: []u8,
+
+    pub fn abAppend(ab: *Abuf, s: []const u8, alloc: std.mem.Allocator) !void {
+
+        // resize before realloc
+        if (alloc.resize(ab.b, ab.b.len + s.len)) {
+            ab.b.len += s.len;
+            @memcpy(ab.b[ab.b.len - s.len ..], s);
+            return;
+        }
+
+        var new = try alloc.realloc(ab.b, ab.b.len + s.len);
+        @memcpy(new[ab.b.len..], s);
+        ab.b = new;
+    }
+};
