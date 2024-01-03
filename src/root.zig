@@ -28,6 +28,7 @@ const Key = union(enum) {
 };
 
 const Screen = struct { row: u16, col: u16 };
+const ERow = struct { chars: [*:0]u8, size: usize };
 
 pub fn Termios(comptime WriterType: anytype) type {
     return struct {
@@ -123,6 +124,31 @@ pub fn Editor(comptime WriterType: anytype) type {
 
         screen: Screen,
         cursor: Screen = .{ .row = 0, .col = 0 },
+        num_rows: usize = 0,
+        row: ERow = undefined,
+
+        pub fn open(self: *@This(), file_name: []const u8) !void {
+            const file = try std.fs.cwd().openFile(file_name, .{ .mode = .read_only });
+            const file_reader = file.reader().any();
+
+            var line = std.ArrayList(u8).init(self.alloc);
+            errdefer line.deinit();
+
+            const writer = line.writer();
+
+            file_reader.streamUntilDelimiter(writer, '\n', null) catch |err| switch (err) {
+                error.EndOfStream => {},
+                else => |e| return e,
+            };
+
+            self.row.size = line.items.len;
+            self.row.chars = @ptrCast(try line.toOwnedSlice());
+            self.num_rows = 1;
+        }
+
+        pub fn close(self: *@This()) void {
+            self.alloc.free(self.row.chars[0..self.row.size]);
+        }
 
         pub fn readKey(self: *@This()) !Key {
             var buffer: [1]u8 = undefined;
@@ -220,23 +246,28 @@ pub fn Editor(comptime WriterType: anytype) type {
             defer self.alloc.free(banner);
 
             for (0..self.screen.row) |y| {
-                if (y == self.screen.row / 3) {
-                    const banner_len = @min(banner.len, self.screen.col);
+                if (y >= self.num_rows) {
+                    if (self.num_rows == 0 and y == self.screen.row / 3) {
+                        const banner_len = @min(banner.len, self.screen.col);
 
-                    const padding = (self.screen.col - banner_len) / 2;
+                        const padding = (self.screen.col - banner_len) / 2;
 
-                    var i: u32 = 0;
-                    while (i < padding) : (i += 1) {
-                        try if (i == 0)
-                            abuf.abAppend("~", self.alloc)
-                        else
-                            abuf.abAppend(" ", self.alloc);
-                    }
+                        var i: u32 = 0;
+                        while (i < padding) : (i += 1) {
+                            try if (i == 0)
+                                abuf.abAppend("~", self.alloc)
+                            else
+                                abuf.abAppend(" ", self.alloc);
+                        }
 
-                    try abuf.abAppend(banner[0..banner_len], self.alloc);
-                } else try abuf.abAppend("~", self.alloc);
+                        try abuf.abAppend(banner[0..banner_len], self.alloc);
+                    } else try abuf.abAppend("~", self.alloc);
+                } else {
+                    const len = if (self.row.size > self.screen.col) self.screen.col else self.row.size;
+                    try abuf.abAppend(self.row.chars[0..len], self.alloc);
+                }
 
-                // eraze part of current line
+                // erase part of current line
                 try abuf.abAppend("\x1b[K", self.alloc);
 
                 if (y < self.screen.row - 1) {

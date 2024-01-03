@@ -2,9 +2,11 @@ const std = @import("std");
 const os = std.os;
 const fs = std.fs;
 const root = @import("root.zig");
+const Termios = root.Termios;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
     var stdout = std.io.getStdOut();
     var stdin = std.io.getStdIn();
 
@@ -22,7 +24,17 @@ pub fn main() !void {
     // init screen
     const screen = try termios.getWindowSize();
 
-    var editor = root.kilo(stdout_writer, stdin_reader, screen, gpa.allocator());
+    var editor = root.kilo(stdout_writer, stdin_reader, screen, alloc);
+
+    var arg_iter = try std.process.argsWithAllocator(alloc);
+    defer arg_iter.deinit();
+
+    _ = arg_iter.next().?;
+    try if (arg_iter.next()) |file|
+        editor.open(file)
+    else
+        error.ExpectedFileName;
+    defer editor.close();
 
     while (true) {
         try editor.refreshScreen();
