@@ -31,9 +31,8 @@ pub fn main() !void {
 
     _ = arg_iter.next().?;
     try if (arg_iter.next()) |file|
-        editor.open(file)
-    else
-        error.ExpectedFileName;
+        editor.open(file);
+
     defer editor.close();
 
     while (true) {

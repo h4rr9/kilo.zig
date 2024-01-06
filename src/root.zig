@@ -28,7 +28,7 @@ const Key = union(enum) {
 };
 
 const Screen = struct { row: u16, col: u16 };
-const ERow = struct { chars: [*:0]u8, size: usize };
+const ERow = struct { chars: []u8 };
 
 pub fn Termios(comptime WriterType: anytype) type {
     return struct {
@@ -113,7 +113,13 @@ pub fn kilo(
     screen: Screen,
     alloc: std.mem.Allocator,
 ) Editor(@TypeOf(writer)) {
-    return .{ .writer = writer, .reader = reader, .screen = screen, .alloc = alloc };
+    return .{
+        .writer = writer,
+        .reader = reader,
+        .screen = screen,
+        .alloc = alloc,
+        .rows = std.ArrayList(ERow).init(alloc),
+    };
 }
 
 pub fn Editor(comptime WriterType: anytype) type {
@@ -123,9 +129,16 @@ pub fn Editor(comptime WriterType: anytype) type {
         alloc: std.mem.Allocator,
 
         screen: Screen,
+        rows: std.ArrayList(ERow),
         cursor: Screen = .{ .row = 0, .col = 0 },
-        num_rows: usize = 0,
-        row: ERow = undefined,
+        row_offset: usize = 0,
+        col_offset: usize = 0,
+
+        pub fn appendRow(self: *@This(), s: []u8) !void {
+            // NOTE is append better ?
+            const row = try self.rows.addOne();
+            row.* = .{ .chars = s };
+        }
 
         pub fn open(self: *@This(), file_name: []const u8) !void {
             const file = try std.fs.cwd().openFile(file_name, .{ .mode = .read_only });
@@ -136,18 +149,19 @@ pub fn Editor(comptime WriterType: anytype) type {
 
             const writer = line.writer();
 
-            file_reader.streamUntilDelimiter(writer, '\n', null) catch |err| switch (err) {
+            while (file_reader.streamUntilDelimiter(writer, '\n', null)) {
+                try self.appendRow(try line.toOwnedSlice());
+            } else |err| switch (err) {
                 error.EndOfStream => {},
                 else => |e| return e,
-            };
-
-            self.row.size = line.items.len;
-            self.row.chars = @ptrCast(try line.toOwnedSlice());
-            self.num_rows = 1;
+            }
         }
 
         pub fn close(self: *@This()) void {
-            self.alloc.free(self.row.chars[0..self.row.size]);
+            for (self.rows.items) |*item| {
+                self.alloc.free(item.chars);
+            }
+            self.rows.deinit();
         }
 
         pub fn readKey(self: *@This()) !Key {
@@ -220,6 +234,8 @@ pub fn Editor(comptime WriterType: anytype) type {
         }
 
         pub fn refreshScreen(self: *@This()) !void {
+            self.scroll();
+
             var abuf: Abuf = .{ .b = try self.alloc.alloc(u8, 0) };
             defer self.alloc.free(abuf.b);
 
@@ -231,7 +247,14 @@ pub fn Editor(comptime WriterType: anytype) type {
             try self.drawRows(&abuf);
 
             // put cursor at position
-            const slice = try std.fmt.allocPrint(self.alloc, "\x1b[{d};{d}H", .{ self.cursor.row + 1, self.cursor.col + 1 });
+            const slice = try std.fmt.allocPrint(
+                self.alloc,
+                "\x1b[{d};{d}H",
+                .{
+                    self.cursor.row - self.row_offset + 1,
+                    self.cursor.col - self.col_offset + 1,
+                },
+            );
             defer self.alloc.free(slice);
             try abuf.abAppend(slice, self.alloc);
 
@@ -246,13 +269,14 @@ pub fn Editor(comptime WriterType: anytype) type {
             defer self.alloc.free(banner);
 
             for (0..self.screen.row) |y| {
-                if (y >= self.num_rows) {
-                    if (self.num_rows == 0 and y == self.screen.row / 3) {
+                const file_row: usize = y + self.row_offset;
+                if (file_row >= self.rows.items.len) {
+                    if (self.rows.items.len == 0 and y == self.screen.row / 3) {
                         const banner_len = @min(banner.len, self.screen.col);
 
                         const padding = (self.screen.col - banner_len) / 2;
 
-                        var i: u32 = 0;
+                        var i: usize = 0;
                         while (i < padding) : (i += 1) {
                             try if (i == 0)
                                 abuf.abAppend("~", self.alloc)
@@ -263,8 +287,11 @@ pub fn Editor(comptime WriterType: anytype) type {
                         try abuf.abAppend(banner[0..banner_len], self.alloc);
                     } else try abuf.abAppend("~", self.alloc);
                 } else {
-                    const len = if (self.row.size > self.screen.col) self.screen.col else self.row.size;
-                    try abuf.abAppend(self.row.chars[0..len], self.alloc);
+                    const row = &self.rows.items[file_row];
+                    if (row.chars.len > self.col_offset) {
+                        const len = @min(row.chars.len - self.col_offset, self.screen.col);
+                        try abuf.abAppend(row.chars[self.col_offset .. self.col_offset + len], self.alloc);
+                    }
                 }
 
                 // erase part of current line
@@ -276,14 +303,19 @@ pub fn Editor(comptime WriterType: anytype) type {
             }
         }
 
-        pub fn moveCursor(self: *@This(), key: EditorKey) void {
+        fn scroll(self: *@This()) void {
+            if (self.cursor.row < self.row_offset) self.row_offset = self.cursor.row;
+            if (self.cursor.row >= self.row_offset + self.screen.row) self.row_offset = self.cursor.row - self.screen.row + 1;
+            if (self.cursor.col < self.col_offset) self.col_offset = self.cursor.col;
+            if (self.cursor.col >= self.col_offset + self.screen.col) self.col_offset = self.cursor.col - self.screen.col + 1;
+        }
+
+        fn moveCursor(self: *@This(), key: EditorKey) void {
             switch (key) {
                 .ARROW_LEFT => self.cursor.col -|= 1,
-                .ARROW_RIGHT => if (self.cursor.col != self.screen.col - 1) {
-                    self.cursor.col += 1;
-                },
+                .ARROW_RIGHT => self.cursor.col += 1,
                 .ARROW_UP => self.cursor.row -|= 1,
-                .ARROW_DOWN => if (self.cursor.row != self.screen.row - 1) {
+                .ARROW_DOWN => if (self.cursor.row < self.rows.items.len) {
                     self.cursor.row += 1;
                 },
                 else => unreachable,
