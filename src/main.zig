@@ -4,9 +4,14 @@ const fs = std.fs;
 const root = @import("root.zig");
 const Termios = root.Termios;
 
+const builtin = @import("builtin");
+
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc = gpa.allocator();
+    const alloc = if (builtin.mode == .Debug) blk: {
+        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+        break :blk gpa.allocator();
+    } else std.heap.c_allocator;
+
     var stdout = std.io.getStdOut();
     var stdin = std.io.getStdIn();
 
@@ -34,6 +39,8 @@ pub fn main() !void {
         editor.open(file);
 
     defer editor.close();
+
+    editor.setStatusMessage("HELP: Ctrl-Q = quit");
 
     while (true) {
         try editor.refreshScreen();
