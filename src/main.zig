@@ -4,8 +4,10 @@ const fs = std.fs;
 const root = @import("root.zig");
 const Termios = root.Termios;
 
+// something
+// inghing
+// ghinghere!
 const builtin = @import("builtin");
-
 pub fn main() !void {
     const alloc = if (builtin.mode == .Debug) blk: {
         var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -40,7 +42,7 @@ pub fn main() !void {
 
     defer editor.close();
 
-    editor.setStatusMessage("HELP: Ctrl-Q = quit");
+    editor.setStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit");
 
     while (true) {
         try editor.refreshScreen();
