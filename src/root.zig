@@ -13,25 +13,26 @@ const KeyResult = enum {
 };
 
 const EditorKey = enum {
-    ARROW_LEFT,
-    ARROW_RIGHT,
-    ARROW_UP,
-    ARROW_DOWN,
-    HOME_KEY,
-    END_KEY,
-    DEL_KEY,
-    PAGE_UP,
-    PAGE_DOWN,
-    BACKSPACE,
-    ENTER,
-    ESCAPE,
-    SAVE,
+    arrow_left,
+    arrow_right,
+    arrow_up,
+    arrow_down,
+    home,
+    end,
+    delete,
+    page_up,
+    page_down,
+    backspace,
+    enter,
+    escape,
+    save,
+    find,
+    exit,
 };
 
 const Key = union(enum) {
     key: u8,
     editor_key: EditorKey,
-    exit,
 };
 
 const Screen = struct { row: usize, col: usize };
@@ -96,13 +97,22 @@ const ERow = struct {
         alloc.free(row.render);
     }
 
-    fn renderCol(row: *const ERow, cx: usize) usize {
+    fn cxToRx(row: *const ERow, cx: usize) usize {
         var rx: usize = 0;
         return for (row.chars[0..row.size], 0..) |c, j| {
             if (j >= cx) break rx;
             if (c == '\t') rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
             rx += 1;
         } else rx;
+    }
+
+    fn rxToCx(row: *const ERow, rx: usize) usize {
+        var c_rx: usize = 0;
+        return for (row.chars[0..row.size], 0..) |c, j| {
+            if (c == '\t') c_rx += (KILO_TAB_STOP - 1) - (c_rx % KILO_TAB_STOP);
+            c_rx += 1;
+            if (c_rx > rx) return j;
+        } else row.size;
     }
 };
 
@@ -255,51 +265,51 @@ pub fn Editor(comptime WriterType: anytype) type {
         var quit_times: u2 = KILO_QUIT_TIMES;
         pub fn processKeyPress(self: *@This()) !KeyResult {
             switch (try self.readKey()) {
-                .exit => {
-                    if (self.dirty and quit_times > 0) {
-                        const status = try std.fmt.allocPrint(
-                            self.alloc,
-                            "WARNING!!! File has unsaved changes. Press Ctrl-Q {d} more times to quit.",
-                            .{quit_times},
-                        );
-                        defer self.alloc.free(status);
-                        self.setStatusMessage(status);
-                        quit_times -= 1;
-                        return .Default;
-                    }
-
-                    _ = try self.writer.write("\x1b[2J");
-                    _ = try self.writer.write("\x1b[H");
-
-                    return .CtrlQPressed;
-                },
                 .editor_key => |c| switch (c) {
-                    .ARROW_UP, .ARROW_DOWN, .ARROW_LEFT, .ARROW_RIGHT => |a_key| self.moveCursor(a_key),
-                    .PAGE_UP, .PAGE_DOWN => |p_key| {
-                        self.cursor.row = switch (p_key) {
-                            .PAGE_UP => self.row_offset,
-                            .PAGE_DOWN => @min(self.row_offset + self.screen.row - 1, self.rows.items.len),
-                            else => unreachable,
-                        };
+                    .exit => {
+                        if (self.dirty and quit_times > 0) {
+                            const status = try std.fmt.allocPrint(
+                                self.alloc,
+                                "WARNING!!! File has unsaved changes. Press Ctrl-Q {d} more times to quit.",
+                                .{quit_times},
+                            );
+                            defer self.alloc.free(status);
+                            self.setStatusMessage(status);
+                            quit_times -= 1;
+                            return .Default;
+                        }
+
+                        _ = try self.writer.write("\x1b[2J");
+                        _ = try self.writer.write("\x1b[H");
+
+                        return .CtrlQPressed;
+                    },
+                    .arrow_up, .arrow_down, .arrow_left, .arrow_right => |a_key| self.moveCursor(a_key),
+                    .page_up, .page_down => |p_key| {
+                        self.cursor.row = if (p_key == .page_up)
+                            self.row_offset
+                        else
+                            @min(self.row_offset + self.screen.row - 1, self.rows.items.len);
+                        const key: EditorKey = if (p_key == .page_up) .arrow_up else .arrow_down;
 
                         var times: u16 = 0;
-                        const key: EditorKey = if (p_key == .PAGE_UP) .ARROW_UP else .ARROW_DOWN;
                         while (times < self.screen.row) : (times += 1)
                             self.moveCursor(key);
                     },
-                    .HOME_KEY => self.cursor.col = 0,
-                    .END_KEY => if (self.cursor.row < self.rows.items.len) {
+                    .home => self.cursor.col = 0,
+                    .end => if (self.cursor.row < self.rows.items.len) {
                         self.cursor.col = self.rows.items[self.cursor.row].render.len;
                     },
-                    .ENTER => try self.insertNewLine(),
-                    .ESCAPE => {},
-                    .DEL_KEY, .BACKSPACE => |k| {
-                        if (k == .DEL_KEY)
-                            self.moveCursor(.ARROW_RIGHT);
+                    .enter => try self.insertNewLine(),
+                    .escape => {},
+                    .delete, .backspace => |k| {
+                        if (k == .delete)
+                            self.moveCursor(.arrow_right);
 
                         try self.deleteChar();
                     },
-                    .SAVE => try self.save(),
+                    .save => try self.save(),
+                    .find => try self.find(),
                 },
                 .key => |k| try self.insertChar(k),
             }
@@ -351,10 +361,12 @@ pub fn Editor(comptime WriterType: anytype) type {
             self.status_msg_time = std.time.timestamp();
         }
 
+        const CallBack = ?*const fn (ctx: *@This(), s: []u8, c: Key) void;
+
         ///
         /// The returned slice needs to be freed
         ///
-        fn statusPrompt(self: *@This(), comptime prompt: []const u8) !?[]u8 {
+        fn statusPrompt(self: *@This(), comptime prompt: []const u8, callback: CallBack) !?[]u8 {
             var buf = try std.ArrayList(u8).initCapacity(self.alloc, 128);
             errdefer buf.deinit();
 
@@ -369,21 +381,26 @@ pub fn Editor(comptime WriterType: anytype) type {
 
                 switch (try self.readKey()) {
                     .editor_key => |ek| switch (ek) {
-                        .ENTER => {
+                        .enter => {
                             self.setStatusMessage("");
-                            break try buf.toOwnedSlice();
+                            const buf_slice = try buf.toOwnedSlice();
+                            if (callback) |cb| cb(self, buf_slice, .{ .editor_key = .enter });
+                            break buf_slice;
                         },
-                        .ESCAPE => {
+                        .escape => {
                             self.setStatusMessage("");
+                            defer buf.deinit();
+
+                            if (callback) |cb| cb(self, buf.items, .{ .editor_key = .escape });
                             break null;
                         },
-                        .DEL_KEY, .BACKSPACE => _ = buf.popOrNull(),
-                        else => std.atomic.spinLoopHint(),
+                        .delete, .backspace => _ = buf.popOrNull(),
+                        else => if (callback) |cb| cb(self, buf.items, .{ .editor_key = ek }),
                     },
                     .key => |k| if (!std.ascii.isControl(k) and k < 128) {
                         try writer.writeByte(k);
+                        if (callback) |cb| cb(self, buf.items, .{ .key = k });
                     },
-                    else => std.atomic.spinLoopHint(),
                 }
             };
         }
@@ -410,9 +427,73 @@ pub fn Editor(comptime WriterType: anytype) type {
             return buf;
         }
 
+        fn find(self: *@This()) !void {
+            const saved_cursor_row = self.cursor.row;
+            const saved_cursor_col = self.cursor.col;
+            const saved_col_offset = self.col_offset;
+            const saved_row_offset = self.row_offset;
+
+            const query = try self.statusPrompt("Search {s} (Use ESC/Arrows/Enter)", @This().findCallBack);
+            if (query) |q| self.alloc.free(q) else {
+                self.cursor.row = saved_cursor_row;
+                self.cursor.col = saved_cursor_col;
+                self.row_offset = saved_row_offset;
+                self.col_offset = saved_col_offset;
+            }
+        }
+
+        var last_match: ?usize = null;
+        var find_forward: bool = true;
+        fn findCallBack(self: *@This(), query: []u8, key: Key) void {
+            switch (key) {
+                .editor_key => |ek| switch (ek) {
+                    .enter, .escape => {
+                        last_match = null;
+                        find_forward = true;
+                        return;
+                    },
+                    .arrow_right, .arrow_down => find_forward = true,
+                    .arrow_left, .arrow_up => find_forward = false,
+                    else => {
+                        last_match = null;
+                        find_forward = true;
+                    },
+                },
+                else => {
+                    last_match = null;
+                    find_forward = true;
+                },
+            }
+
+            if (last_match == null) find_forward = true;
+            var current = last_match;
+
+            var i: usize = 0;
+            while (i < self.rows.items.len) : (i += 1) {
+                if (current) |*c| {
+                    if (find_forward)
+                        c.* = if (c.* == self.rows.items.len - 1) 0 else c.* + 1
+                    else
+                        c.* = if (c.* == 0) self.rows.items.len - 1 else c.* - 1;
+                } else current = if (find_forward)
+                    0
+                else
+                    self.rows.items.len - 1;
+                const r = &self.rows.items[current.?];
+
+                if (std.mem.indexOf(u8, r.render, query)) |pos| {
+                    last_match = current;
+                    self.cursor.row = current.?;
+                    self.cursor.col = r.rxToCx(pos);
+                    self.row_offset = self.rows.items.len;
+                    break;
+                }
+            }
+        }
+
         fn save(self: *@This()) !void {
             const file_name = self.file_name orelse f: {
-                if (try self.statusPrompt("Save as: {s}")) |file_name|
+                if (try self.statusPrompt("Save as: {s}", null)) |file_name|
                     break :f file_name;
 
                 self.setStatusMessage("Save aborted");
@@ -556,37 +637,38 @@ pub fn Editor(comptime WriterType: anytype) type {
                         _ = self.reader.read(seq[2..3]) catch return .{ .key = c };
                         if (seq[2] == '~')
                             return switch (seq[1]) {
-                                '1', '7' => .{ .editor_key = .HOME_KEY },
-                                '4', '8' => .{ .editor_key = .END_KEY },
-                                '3' => .{ .editor_key = .DEL_KEY },
-                                '5' => .{ .editor_key = .PAGE_UP },
-                                '6' => .{ .editor_key = .PAGE_DOWN },
+                                '1', '7' => .{ .editor_key = .home },
+                                '4', '8' => .{ .editor_key = .end },
+                                '3' => .{ .editor_key = .delete },
+                                '5' => .{ .editor_key = .page_up },
+                                '6' => .{ .editor_key = .page_down },
                                 else => .{ .key = c },
                             };
                     } else return switch (seq[1]) {
-                        'A' => .{ .editor_key = .ARROW_UP },
-                        'B' => .{ .editor_key = .ARROW_DOWN },
-                        'C' => .{ .editor_key = .ARROW_RIGHT },
-                        'D' => .{ .editor_key = .ARROW_LEFT },
-                        'H' => .{ .editor_key = .HOME_KEY },
-                        'F' => .{ .editor_key = .END_KEY },
+                        'A' => .{ .editor_key = .arrow_up },
+                        'B' => .{ .editor_key = .arrow_down },
+                        'C' => .{ .editor_key = .arrow_right },
+                        'D' => .{ .editor_key = .arrow_left },
+                        'H' => .{ .editor_key = .home },
+                        'F' => .{ .editor_key = .end },
                         else => .{ .key = c },
                     }
                 else if (seq[0] == 'O')
                     return switch (seq[1]) {
-                        'H' => .{ .editor_key = .HOME_KEY },
-                        'F' => .{ .editor_key = .END_KEY },
+                        'H' => .{ .editor_key = .home },
+                        'F' => .{ .editor_key = .end },
                         else => .{ .key = c },
                     };
             }
 
             return switch (c) {
-                std.ascii.control_code.xon => .exit,
+                std.ascii.control_code.xon => .{ .editor_key = .exit },
                 // NOTE: ascii del is backspace, <esc>[3~ is del
-                std.ascii.control_code.bs, std.ascii.control_code.del => .{ .editor_key = .BACKSPACE },
-                std.ascii.control_code.ff, std.ascii.control_code.esc => .{ .editor_key = .ESCAPE },
-                std.ascii.control_code.cr => .{ .editor_key = .ENTER },
-                std.ascii.control_code.dc3 => .{ .editor_key = .SAVE },
+                std.ascii.control_code.bs, std.ascii.control_code.del => .{ .editor_key = .backspace },
+                std.ascii.control_code.ff, std.ascii.control_code.esc => .{ .editor_key = .escape },
+                std.ascii.control_code.cr => .{ .editor_key = .enter },
+                std.ascii.control_code.dc3 => .{ .editor_key = .save },
+                std.ascii.control_code.ack => .{ .editor_key = .find },
                 else => |x| .{ .key = x },
             };
         }
@@ -627,7 +709,7 @@ pub fn Editor(comptime WriterType: anytype) type {
         fn scroll(self: *@This()) void {
             self.render_col = if (self.cursor.row < self.rows.items.len) blk: {
                 const row = &self.rows.items[self.cursor.row];
-                break :blk row.renderCol(self.cursor.col);
+                break :blk row.cxToRx(self.cursor.col);
             } else 0;
 
             if (self.cursor.row < self.row_offset) {
@@ -646,13 +728,13 @@ pub fn Editor(comptime WriterType: anytype) type {
             var row: ?*ERow = if (self.cursor.row >= self.rows.items.len) null else &self.rows.items[self.cursor.row];
 
             switch (key) {
-                .ARROW_LEFT => if (self.cursor.col != 0) {
+                .arrow_left => if (self.cursor.col != 0) {
                     self.cursor.col -|= 1;
                 } else if (self.cursor.row != 0) {
                     self.cursor.row -|= 1;
                     self.cursor.col = self.rows.items[self.cursor.row].size;
                 },
-                .ARROW_RIGHT => if (row) |r| {
+                .arrow_right => if (row) |r| {
                     if (self.cursor.col < r.size) {
                         self.cursor.col += 1;
                     } else if (self.cursor.col == r.size) {
@@ -660,8 +742,8 @@ pub fn Editor(comptime WriterType: anytype) type {
                         self.cursor.col = 0;
                     }
                 },
-                .ARROW_UP => self.cursor.row -|= 1,
-                .ARROW_DOWN => if (self.cursor.row < self.rows.items.len) {
+                .arrow_up => self.cursor.row -|= 1,
+                .arrow_down => if (self.cursor.row < self.rows.items.len) {
                     self.cursor.row += 1;
                 },
                 else => unreachable,

@@ -42,7 +42,7 @@ pub fn main() !void {
 
     defer editor.close();
 
-    editor.setStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit");
+    editor.setStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
 
     while (true) {
         try editor.refreshScreen();
