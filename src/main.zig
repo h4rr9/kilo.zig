@@ -2,12 +2,9 @@ const std = @import("std");
 const os = std.os;
 const fs = std.fs;
 const root = @import("root.zig");
-const Termios = root.Termios;
-
-// something
-// inghing
-// ghinghere!
+const term = @import("term.zig");
 const builtin = @import("builtin");
+
 pub fn main() !void {
     const alloc = if (builtin.mode == .Debug) blk: {
         var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -23,13 +20,13 @@ pub fn main() !void {
     const stdin_reader = stdin.reader().any();
     const stdout_writer = stdout.writer();
 
-    var termios = try root.termios(&stdin, &stdout, stdout_writer, stdin_reader);
+    var terminal = try term.term(&stdin, &stdout, stdout_writer, stdin_reader);
     // enable raw mode
-    try termios.enableRawMode();
+    try terminal.enableRawMode();
     // disable raw mode on exit
-    defer termios.disableRawMode() catch @panic("Unable to reset termios.");
+    defer terminal.disableRawMode() catch @panic("Unable to reset termios.");
     // init screen
-    const screen = try termios.getWindowSize();
+    const screen = try terminal.getWindowSize();
 
     var editor = root.kilo(stdout_writer, stdin_reader, screen, alloc);
 
