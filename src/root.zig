@@ -2,10 +2,9 @@ const std = @import("std");
 const os = std.os;
 const fs = std.fs;
 const builtin = @import("builtin");
-
 const term = @import("term.zig");
 const Screen = term.Screen;
-
+// from kilo
 const KILO_VERSION = "0.0.1";
 const KILO_TAB_STOP = 8;
 const KILO_STATUS_MESSAGE_DURATION = 5;
@@ -14,6 +13,20 @@ const KILO_QUIT_TIMES = 3;
 const KeyResult = enum {
     CtrlQPressed,
     Default,
+};
+
+const Highlight = enum {
+    number,
+    normal,
+    match,
+
+    fn toColor(hl: *const Highlight) usize {
+        return switch (hl.*) {
+            .number => 31,
+            .match => 34,
+            else => 37,
+        };
+    }
 };
 
 const EditorKey = enum {
@@ -43,6 +56,7 @@ const ERow = struct {
     chars: []u8,
     size: usize,
     render: []u8,
+    hl: []Highlight,
 
     fn deleteChar(row: *ERow, at: usize, alloc: std.mem.Allocator) !void {
         if (at < 0 or at > row.size) return;
@@ -50,7 +64,9 @@ const ERow = struct {
         row.size -|= 1;
 
         alloc.free(row.render);
+        alloc.free(row.hl);
         row.render = try renderSlice(row.chars[0..row.size], alloc);
+        row.hl = try updateSyntax(row.render, alloc);
     }
 
     fn insertChar(row: *ERow, c: u8, at: usize, alloc: std.mem.Allocator) !void {
@@ -62,7 +78,9 @@ const ERow = struct {
         row.size +|= 1;
 
         alloc.free(row.render);
+        alloc.free(row.hl);
         row.render = try renderSlice(row.chars[0..row.size], alloc);
+        row.hl = try updateSyntax(row.render, alloc);
     }
 
     ///
@@ -87,6 +105,21 @@ const ERow = struct {
         return render;
     }
 
+    ///
+    /// returned slice needs to be freed
+    ///
+    fn updateSyntax(chars: []const u8, alloc: std.mem.Allocator) ![]Highlight {
+        const hl = try alloc.alloc(Highlight, chars.len);
+        @memset(hl, .normal);
+
+        for (chars, hl) |c, *i| {
+            if (std.ascii.isDigit(c))
+                i.* = .number;
+        }
+
+        return hl;
+    }
+
     fn appendString(row: *ERow, s: []u8, alloc: std.mem.Allocator) !void {
         row.chars = try alloc.realloc(row.chars, row.size + s.len);
         @memcpy(row.chars[row.size..], s);
@@ -95,9 +128,10 @@ const ERow = struct {
         row.render = try ERow.renderSlice(row.chars[0..row.size], alloc);
     }
 
-    fn free(row: *const ERow, alloc: std.mem.Allocator) void {
+    fn deinit(row: *const ERow, alloc: std.mem.Allocator) void {
         alloc.free(row.chars);
         alloc.free(row.render);
+        alloc.free(row.hl);
     }
 
     fn cxToRx(row: *const ERow, cx: usize) usize {
@@ -180,12 +214,9 @@ pub fn Editor(comptime WriterType: anytype) type {
         }
 
         pub fn close(self: *@This()) void {
-            for (self.rows.items) |*item| {
-                self.alloc.free(item.chars);
-                self.alloc.free(item.render);
-            }
-            self.rows.deinit();
+            for (self.rows.items) |*row| row.deinit(self.alloc);
             if (self.file_name) |f| self.alloc.free(f);
+            self.rows.deinit();
         }
 
         var quit_times: u2 = KILO_QUIT_TIMES;
@@ -248,14 +279,14 @@ pub fn Editor(comptime WriterType: anytype) type {
         pub fn refreshScreen(self: *@This()) !void {
             self.scroll();
 
-            var abuf: Abuf = .{ .b = try self.alloc.alloc(u8, 0) };
-            defer self.alloc.free(abuf.b);
+            var abuf: Abuf = try Abuf.init(self.alloc);
+            defer abuf.deinit();
 
             // hide cursor
             // and
             // move cursor to top left
-            try abuf.append("\x1b[?25l", self.alloc);
-            try abuf.append("\x1b[H", self.alloc);
+            try abuf.append("\x1b[?25l");
+            try abuf.append("\x1b[H");
 
             try self.drawRows(&abuf);
             try self.drawStatusBar(&abuf);
@@ -271,10 +302,10 @@ pub fn Editor(comptime WriterType: anytype) type {
                 },
             );
             defer self.alloc.free(slice);
-            try abuf.append(slice, self.alloc);
+            try abuf.append(slice);
 
             // show cursor
-            try abuf.append("\x1b[?25h", self.alloc);
+            try abuf.append("\x1b[?25h");
 
             _ = try self.writer.write(abuf.b);
         }
@@ -287,7 +318,7 @@ pub fn Editor(comptime WriterType: anytype) type {
             self.status_msg_time = std.time.timestamp();
         }
 
-        const CallBack = ?*const fn (ctx: *@This(), s: []u8, c: Key) void;
+        const CallBack = ?*const fn (ctx: *@This(), s: []u8, c: Key) error{OutOfMemory}!void;
 
         ///
         /// The returned slice needs to be freed
@@ -310,22 +341,22 @@ pub fn Editor(comptime WriterType: anytype) type {
                         .enter => {
                             self.setStatusMessage("");
                             const buf_slice = try buf.toOwnedSlice();
-                            if (callback) |cb| cb(self, buf_slice, .{ .editor_key = .enter });
+                            if (callback) |cb| try cb(self, buf_slice, .{ .editor_key = .enter });
                             break buf_slice;
                         },
                         .escape => {
                             self.setStatusMessage("");
                             defer buf.deinit();
 
-                            if (callback) |cb| cb(self, buf.items, .{ .editor_key = .escape });
+                            if (callback) |cb| try cb(self, buf.items, .{ .editor_key = .escape });
                             break null;
                         },
                         .delete, .backspace => _ = buf.popOrNull(),
-                        else => if (callback) |cb| cb(self, buf.items, .{ .editor_key = ek }),
+                        else => if (callback) |cb| try cb(self, buf.items, .{ .editor_key = ek }),
                     },
                     .key => |k| if (!std.ascii.isControl(k) and k < 128) {
                         try writer.writeByte(k);
-                        if (callback) |cb| cb(self, buf.items, .{ .key = k });
+                        if (callback) |cb| try cb(self, buf.items, .{ .key = k });
                     },
                 }
             };
@@ -370,7 +401,15 @@ pub fn Editor(comptime WriterType: anytype) type {
 
         var last_match: ?usize = null;
         var find_forward: bool = true;
-        fn findCallBack(self: *@This(), query: []u8, key: Key) void {
+        var saved_hl: []Highlight = undefined;
+        var saved_hl_line: ?usize = null;
+        fn findCallBack(self: *@This(), query: []u8, key: Key) error{OutOfMemory}!void {
+            if (saved_hl_line) |saved_line| {
+                @memcpy(self.rows.items[saved_line].hl, saved_hl);
+                self.alloc.free(saved_hl);
+                saved_hl_line = null;
+            }
+
             switch (key) {
                 .editor_key => |ek| switch (ek) {
                     .enter, .escape => {
@@ -412,6 +451,11 @@ pub fn Editor(comptime WriterType: anytype) type {
                     self.cursor.row = current.?;
                     self.cursor.col = r.rxToCx(pos);
                     self.row_offset = self.rows.items.len;
+
+                    saved_hl_line = current.?;
+                    saved_hl = try self.alloc.dupe(Highlight, r.hl);
+
+                    @memset(r.hl[pos..][0..query.len], .match);
                     break;
                 }
             }
@@ -451,7 +495,7 @@ pub fn Editor(comptime WriterType: anytype) type {
             if (at < 0 or at >= self.rows.items.len) return;
 
             const row = self.rows.orderedRemove(at);
-            row.free(self.alloc);
+            row.deinit(self.alloc);
 
             self.dirty = true;
         }
@@ -507,26 +551,30 @@ pub fn Editor(comptime WriterType: anytype) type {
         fn insertRow(self: *@This(), s: []u8, at: usize) !void {
             if (at < 0 or at > self.rows.items.len) return;
 
+            const render = try ERow.renderSlice(s, self.alloc);
+            const hl = try ERow.updateSyntax(render, self.alloc);
+
             try self.rows.insert(at, .{
                 .chars = s,
                 .size = s.len,
-                .render = try ERow.renderSlice(s, self.alloc),
+                .render = render,
+                .hl = hl,
             });
 
             self.dirty = true;
         }
 
         fn drawStatusMessageBar(self: *@This(), abuf: *Abuf) !void {
-            try abuf.append("\x1b[K", self.alloc);
+            try abuf.append("\x1b[K");
 
             const msglen = @min(self.status.len, self.screen.col);
 
             if (msglen > 0 and std.time.timestamp() - self.status_msg_time < KILO_STATUS_MESSAGE_DURATION)
-                try abuf.append(self.status[0..msglen], self.alloc);
+                try abuf.append(self.status[0..msglen]);
         }
 
         fn drawStatusBar(self: *@This(), abuf: *Abuf) !void {
-            try abuf.append("\x1b[7m", self.alloc);
+            try abuf.append("\x1b[7m");
 
             const status = try std.fmt.allocPrint(self.alloc, "{s} - {d} lines {s}", .{
                 self.file_name orelse "[No Name]",
@@ -541,11 +589,11 @@ pub fn Editor(comptime WriterType: anytype) type {
             defer self.alloc.free(rstatus);
 
             const len = @min(self.screen.col, status.len);
-            try abuf.append(status[0..len], self.alloc);
-            try abuf.appendN(" ", self.screen.col -| (len + rstatus.len + 1), self.alloc);
-            try abuf.append(rstatus, self.alloc);
+            try abuf.append(status[0..len]);
+            try abuf.appendN(" ", self.screen.col -| (len + rstatus.len + 1));
+            try abuf.append(rstatus);
 
-            try abuf.append("\x1b[m\r\n", self.alloc);
+            try abuf.append("\x1b[m\r\n");
         }
 
         fn readKey(self: *@This()) !Key {
@@ -600,36 +648,75 @@ pub fn Editor(comptime WriterType: anytype) type {
         }
 
         fn drawRows(self: *@This(), abuf: *Abuf) !void {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            const arena_alloc = arena.allocator();
+
             for (0..self.screen.row) |y| {
                 const file_row: usize = y + self.row_offset;
                 if (file_row >= self.rows.items.len) {
                     if (self.rows.items.len == 0 and y == self.screen.row / 3) {
-                        const banner = try std.fmt.allocPrint(self.alloc, "Kilo editor -- version {s}", .{KILO_VERSION});
-                        defer self.alloc.free(banner);
+                        const banner = try std.fmt.allocPrint(arena_alloc, "Kilo editor -- version {s}", .{KILO_VERSION});
                         const banner_len = @min(banner.len, self.screen.col);
 
                         const padding = (self.screen.col - banner_len) / 2;
 
                         if (padding > 0) {
-                            try abuf.append("~", self.alloc);
+                            try abuf.append("~");
                             if (padding > 2) {
-                                try abuf.appendN(" ", padding - 1, self.alloc);
+                                try abuf.appendN(" ", padding - 1);
                             }
                         }
 
-                        try abuf.append(banner[0..banner_len], self.alloc);
-                    } else try abuf.append("~", self.alloc);
+                        try abuf.append(banner[0..banner_len]);
+                    } else try abuf.append("~");
                 } else {
                     const row = &self.rows.items[file_row];
                     if (row.render.len > self.col_offset) {
                         const len = @min(row.render.len - self.col_offset, self.screen.col);
-                        try abuf.append(row.render[self.col_offset..][0..len], self.alloc);
+
+                        const render = row.render[self.col_offset..][0..len];
+                        const hls = row.hl[self.col_offset..][0..len];
+                        var current_color: ?usize = null;
+
+                        for (render, hls) |c, hl| {
+                            switch (hl) {
+                                .normal => {
+                                    if (current_color != null) {
+                                        try abuf.append("\x1b[39m");
+                                        current_color = null;
+                                    }
+                                    try abuf.append(&[1]u8{c});
+                                },
+                                else => |h| {
+                                    const color = h.toColor();
+                                    var color_changed: bool = false;
+                                    if (current_color) |*cur_color| {
+                                        if (cur_color.* != color) {
+                                            cur_color.* = color;
+                                            color_changed = true;
+                                        }
+                                    } else {
+                                        current_color = color;
+                                        color_changed = true;
+                                    }
+                                    if (color_changed) {
+                                        const buf = try std.fmt.allocPrint(arena_alloc, "\x1b[{d}m", .{color});
+                                        try abuf.append(buf);
+                                    }
+
+                                    try abuf.append(&[1]u8{c});
+                                },
+                            }
+                        }
+                        try abuf.append("\x1b[39m");
                     }
                 }
 
                 // erase part of current line
-                try abuf.append("\x1b[K\r\n", self.alloc);
+                try abuf.append("\x1b[K\r\n");
             }
+
+            arena.deinit();
         }
 
         fn scroll(self: *@This()) void {
@@ -688,22 +775,34 @@ pub fn Editor(comptime WriterType: anytype) type {
 
 const Abuf = struct {
     b: []u8,
+    alloc: std.mem.Allocator,
 
-    fn appendN(ab: *Abuf, s: []const u8, n: usize, alloc: std.mem.Allocator) !void {
+    fn init(alloc: std.mem.Allocator) !Abuf {
+        return .{
+            .alloc = alloc,
+            .b = try alloc.alloc(u8, 0),
+        };
+    }
+
+    fn deinit(ab: *Abuf) void {
+        ab.alloc.free(ab.b);
+    }
+
+    fn appendN(ab: *Abuf, s: []const u8, n: usize) !void {
         const new_len = s.len * n;
-        const s_ntimes = try alloc.alloc(u8, new_len);
-        defer alloc.free(s_ntimes);
+        const s_ntimes = try ab.alloc.alloc(u8, new_len);
+        defer ab.alloc.free(s_ntimes);
 
         var offset: usize = 0;
         while (offset < s.len * n) : (offset += s.len)
             @memcpy(s_ntimes[offset..][0..s.len], s);
 
-        try ab.append(s_ntimes, alloc);
+        try ab.append(s_ntimes);
     }
 
-    fn append(ab: *Abuf, s: []const u8, alloc: std.mem.Allocator) !void {
-        var new = try alloc.realloc(ab.b, ab.b.len + s.len);
-        errdefer alloc.free(new);
+    fn append(ab: *Abuf, s: []const u8) !void {
+        var new = try ab.alloc.realloc(ab.b, ab.b.len + s.len);
+        errdefer ab.alloc.free(new);
         @memcpy(new[ab.b.len..], s);
         ab.b = new;
     }
@@ -711,4 +810,21 @@ const Abuf = struct {
 
 test {
     _ = @import("term.zig");
+}
+
+test "hl" {
+    const hl = try ERow.updateSyntax("a11b22c33", std.testing.allocator);
+    defer std.testing.allocator.free(hl);
+
+    try std.testing.expectEqualSlices(Highlight, &[9]Highlight{
+        .normal, // a
+        .number, // 1
+        .number, // 1
+        .normal, // b
+        .number, // 2
+        .number, // 2
+        .normal, // c
+        .number, // 3
+        .number, // 3
+    }, hl);
 }
