@@ -4,7 +4,7 @@ const fs = std.fs;
 const builtin = @import("builtin");
 const term = @import("term.zig");
 const Screen = term.Screen;
-// from kilo
+
 const KILO_VERSION = "0.0.1";
 const KILO_TAB_STOP = 8;
 const KILO_STATUS_MESSAGE_DURATION = 5;
@@ -19,11 +19,21 @@ const Highlight = enum {
     number,
     normal,
     match,
+    comment,
+    string,
+    keyword,
+    type,
+    multiline_comment,
 
     fn toColor(hl: *const Highlight) usize {
         return switch (hl.*) {
             .number => 31,
             .match => 34,
+            .string => 35,
+            .comment => 36,
+            .keyword => 33,
+            .type => 32,
+            .multiline_comment => 35,
             else => 37,
         };
     }
@@ -52,24 +62,51 @@ const Key = union(enum) {
     editor_key: EditorKey,
 };
 
+fn isSeperator(c: u8) bool {
+    const seps = [_]u8{
+        ',',
+        '.',
+        '(',
+        ')',
+        '+',
+        '-',
+        '/',
+        '*',
+        '=',
+        '~',
+        '%',
+        '<',
+        '>',
+        ',',
+        '[',
+        ']',
+        ';',
+    };
+
+    return std.ascii.isWhitespace(c) or for (seps) |other| {
+        if (other == c) break true;
+    } else false;
+}
+
 const ERow = struct {
     chars: []u8,
     size: usize,
     render: []u8,
     hl: []Highlight,
+    syntax: ?*const EditorSyntax,
+    hl_open_comment: bool,
+    idx: usize,
 
-    fn deleteChar(row: *ERow, at: usize, alloc: std.mem.Allocator) !void {
+    fn deleteChar(row: *ERow, at: usize, rows: ?*std.ArrayList(ERow), alloc: std.mem.Allocator) !void {
         if (at < 0 or at > row.size) return;
         std.mem.copyForwards(u8, row.chars[at .. row.size - 1], row.chars[at + 1 .. row.size]);
         row.size -|= 1;
 
-        alloc.free(row.render);
-        alloc.free(row.hl);
-        row.render = try renderSlice(row.chars[0..row.size], alloc);
-        row.hl = try updateSyntax(row.render, alloc);
+        try row.updateRender(alloc);
+        try row.updateSyntax(rows, alloc);
     }
 
-    fn insertChar(row: *ERow, c: u8, at: usize, alloc: std.mem.Allocator) !void {
+    fn insertChar(row: *ERow, c: u8, at: usize, rows: ?*std.ArrayList(ERow), alloc: std.mem.Allocator) !void {
         const idx = if (at < 0 or at > row.size) row.size else at;
 
         row.chars = try alloc.realloc(row.chars, row.size + 1);
@@ -77,55 +114,144 @@ const ERow = struct {
         row.chars[idx] = c;
         row.size +|= 1;
 
-        alloc.free(row.render);
-        alloc.free(row.hl);
-        row.render = try renderSlice(row.chars[0..row.size], alloc);
-        row.hl = try updateSyntax(row.render, alloc);
+        try row.updateRender(alloc);
+        try row.updateSyntax(rows, alloc);
     }
 
-    ///
-    /// returned slice needs to be freed
-    ///
-    fn renderSlice(chars: []const u8, alloc: std.mem.Allocator) ![]u8 {
-        const count_tabs = std.mem.count(u8, chars, "\t");
-        const render = try alloc.alloc(u8, chars.len + (KILO_TAB_STOP - 1) * count_tabs);
-        errdefer alloc.free(render);
+    fn updateRender(row: *ERow, alloc: std.mem.Allocator) !void {
+        const count_tabs = std.mem.count(u8, row.chars[0..row.size], "\t");
+        row.render = try alloc.realloc(row.render, row.size + (KILO_TAB_STOP - 1) * count_tabs);
+        errdefer alloc.free(row.render);
 
         var idx: usize = 0;
-        for (chars) |c|
+        for (row.chars[0..row.size]) |c|
             if (c == '\t') {
-                render[idx] = ' ';
+                row.render[idx] = ' ';
                 idx += 1;
-                while (idx % KILO_TAB_STOP != 0) : (idx += 1) render[idx] = ' ';
+                while (idx % KILO_TAB_STOP != 0) : (idx += 1) row.render[idx] = ' ';
             } else {
-                render[idx] = c;
+                row.render[idx] = c;
                 idx += 1;
             };
-
-        return render;
     }
 
-    ///
-    /// returned slice needs to be freed
-    ///
-    fn updateSyntax(chars: []const u8, alloc: std.mem.Allocator) ![]Highlight {
-        const hl = try alloc.alloc(Highlight, chars.len);
-        @memset(hl, .normal);
+    fn inComment(row: *const ERow, rows: *const std.ArrayList(ERow)) bool {
+        return row.idx > 0 and rows[row.idx - 1].hl_open_comment;
+    }
 
-        for (chars, hl) |c, *i| {
-            if (std.ascii.isDigit(c))
-                i.* = .number;
+    fn updateSyntax(row: *ERow, rows: ?*std.ArrayList(ERow), alloc: std.mem.Allocator) !void {
+        row.hl = try alloc.realloc(row.hl, row.render.len);
+        @memset(row.hl, .normal);
+
+        if (row.syntax) |syn| {
+            const single_line_comment = syn.singleline_comment_start;
+            const keywords = syn.keywords;
+            const types = syn.types;
+            const multiline_comment = syn.multiline_comment;
+
+            var prev_sep: bool = true;
+            var in_string: u8 = 0;
+            var in_comment: bool = if (rows) |rs| row.idx > 0 and rs.items[row.idx - 1].hl_open_comment else false;
+
+            var i: usize = 0;
+            out_blk: while (i < row.render.len) : (i += 1) {
+                const c = row.render[i];
+                const prev_hl = if (i > 0) row.hl[i - 1] else .normal;
+
+                if (single_line_comment) |scs| {
+                    if (in_string == 0 and !in_comment) {
+                        if (row.render[i..].len >= scs.len and std.mem.eql(u8, scs, row.render[i..][0..scs.len])) {
+                            @memset(row.hl[i..], .comment);
+                            break :out_blk;
+                        }
+                    }
+                }
+
+                if (multiline_comment) |mlc| {
+                    if (in_string == 0) {
+                        if (in_comment) {
+                            row.hl[i] = .multiline_comment;
+                            if (row.render[i..].len >= mlc.end.len and std.mem.eql(u8, row.render[i..][0..mlc.end.len], mlc.end)) {
+                                @memset(row.hl[i..][0..mlc.end.len], .multiline_comment);
+                                i += mlc.end.len - 1;
+                                in_comment = false;
+                                prev_sep = true;
+                            }
+                            continue :out_blk;
+                        } else if (row.render[i..].len >= mlc.start.len and std.mem.eql(u8, row.render[i..][0..mlc.start.len], mlc.start)) {
+                            @memset(row.hl[i..][0..mlc.start.len], .multiline_comment);
+                            i += mlc.start.len - 1;
+                            in_comment = true;
+                        }
+                    }
+                }
+
+                if (syn.flags.strings) {
+                    if (in_string != 0) {
+                        row.hl[i] = .string;
+                        prev_sep = true;
+                        if (c == '\\' and i + 1 < row.render.len) {
+                            row.hl[i + 1] = .string;
+                            i += 1;
+                        } else if (c == in_string) {
+                            in_string = 0;
+                        }
+                        continue :out_blk;
+                    } else {
+                        if (c == '"' or c == '\'') {
+                            in_string = c;
+                            row.hl[i] = .string;
+                            continue :out_blk;
+                        }
+                    }
+                }
+                if (syn.flags.numbers) {
+                    const is_number = std.ascii.isDigit(c) and (prev_sep or prev_hl == .number);
+                    const is_float = c == '.' and prev_hl == .number;
+                    if (is_number or is_float) {
+                        row.hl[i] = .number;
+                        prev_sep = false;
+                        continue :out_blk;
+                    }
+                }
+
+                if (prev_sep) {
+                    inline for (.{ keywords, types }, .{ .keyword, .type }) |words, hl_kind| {
+                        for (words) |word| {
+                            if (row.render[i..].len >= word.len and std.mem.eql(u8, word, row.render[i..][0..word.len])) {
+                                if (row.render[i..].len < word.len + 1 or (row.render[i..].len >= word.len + 1 and isSeperator(row.render[i..][word.len]))) {
+                                    @memset(row.hl[i..][0..word.len], hl_kind);
+                                    i += word.len - 1;
+                                    prev_sep = false;
+                                    continue :out_blk;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                prev_sep = isSeperator(c);
+            }
+
+            if (multiline_comment != null) {
+                const changed = row.hl_open_comment != in_comment;
+                row.hl_open_comment = in_comment;
+                if (rows) |rs| {
+                    if (changed and row.idx + 1 < rs.items.len) {
+                        try rs.items[row.idx + 1].updateSyntax(rs, alloc);
+                    }
+                }
+            }
         }
-
-        return hl;
     }
 
-    fn appendString(row: *ERow, s: []u8, alloc: std.mem.Allocator) !void {
+    fn appendString(row: *ERow, s: []u8, rows: ?*std.ArrayList(ERow), alloc: std.mem.Allocator) !void {
         row.chars = try alloc.realloc(row.chars, row.size + s.len);
         @memcpy(row.chars[row.size..], s);
         row.size +|= s.len;
 
-        row.render = try ERow.renderSlice(row.chars[0..row.size], alloc);
+        try row.updateRender(alloc);
+        try row.updateSyntax(rows, alloc);
     }
 
     fn deinit(row: *const ERow, alloc: std.mem.Allocator) void {
@@ -191,9 +317,13 @@ pub fn Editor(comptime WriterType: anytype) type {
         col_offset: usize,
         render_col: usize,
 
+        syntax: ?*const EditorSyntax,
+
         pub fn open(self: *@This(), file_name: []const u8) !void {
             self.file_name = try self.alloc.dupe(u8, file_name);
             errdefer self.alloc.free(self.file_name.?);
+
+            try self.selectSyntaxHighlight();
 
             const file = try std.fs.cwd().openFile(file_name, .{ .mode = .read_only });
             const file_reader = file.reader().any();
@@ -255,7 +385,7 @@ pub fn Editor(comptime WriterType: anytype) type {
                     },
                     .home => self.cursor.col = 0,
                     .end => if (self.cursor.row < self.rows.items.len) {
-                        self.cursor.col = self.rows.items[self.cursor.row].render.len;
+                        self.cursor.col = self.rows.items[self.cursor.row].size;
                     },
                     .enter => try self.insertNewLine(),
                     .escape => {},
@@ -463,8 +593,11 @@ pub fn Editor(comptime WriterType: anytype) type {
 
         fn save(self: *@This()) !void {
             const file_name = self.file_name orelse f: {
-                if (try self.statusPrompt("Save as: {s}", null)) |file_name|
+                if (try self.statusPrompt("Save as: {s}", null)) |file_name| {
+                    self.file_name = file_name;
+                    try self.selectSyntaxHighlight();
                     break :f file_name;
+                }
 
                 self.setStatusMessage("Save aborted");
                 return;
@@ -495,8 +628,9 @@ pub fn Editor(comptime WriterType: anytype) type {
             if (at < 0 or at >= self.rows.items.len) return;
 
             const row = self.rows.orderedRemove(at);
-            row.deinit(self.alloc);
+            for (self.rows.items[at..]) |*r| r.idx -|= 1;
 
+            row.deinit(self.alloc);
             self.dirty = true;
         }
 
@@ -506,14 +640,14 @@ pub fn Editor(comptime WriterType: anytype) type {
 
             const row = &self.rows.items[self.cursor.row];
             if (self.cursor.col > 0) {
-                try row.deleteChar(self.cursor.col - 1, self.alloc);
+                try row.deleteChar(self.cursor.col - 1, &self.rows, self.alloc);
                 self.cursor.col -|= 1;
                 self.dirty = true;
             } else {
                 const prev_row = &self.rows.items[self.cursor.row - 1];
 
                 self.cursor.col = prev_row.size;
-                try prev_row.appendString(row.chars[0..row.size], self.alloc);
+                try prev_row.appendString(row.chars[0..row.size], &self.rows, self.alloc);
                 try self.delRow(self.cursor.row);
                 self.cursor.row -= 1;
             }
@@ -524,7 +658,7 @@ pub fn Editor(comptime WriterType: anytype) type {
                 try self.insertRow("", self.rows.items.len);
             }
             const row = &self.rows.items[self.cursor.row];
-            try row.insertChar(c, self.cursor.col, self.alloc);
+            try row.insertChar(c, self.cursor.col, &self.rows, self.alloc);
             self.cursor.col +|= 1;
             self.dirty = true;
         }
@@ -540,8 +674,8 @@ pub fn Editor(comptime WriterType: anytype) type {
                 row = &self.rows.items[self.cursor.row];
                 row.size = self.cursor.col;
 
-                self.alloc.free(row.render);
-                row.render = try ERow.renderSlice(row.chars[0..row.size], self.alloc);
+                try row.updateRender(self.alloc);
+                try row.updateSyntax(&self.rows, self.alloc);
             }
 
             self.cursor.row +|= 1;
@@ -551,15 +685,20 @@ pub fn Editor(comptime WriterType: anytype) type {
         fn insertRow(self: *@This(), s: []u8, at: usize) !void {
             if (at < 0 or at > self.rows.items.len) return;
 
-            const render = try ERow.renderSlice(s, self.alloc);
-            const hl = try ERow.updateSyntax(render, self.alloc);
-
             try self.rows.insert(at, .{
                 .chars = s,
                 .size = s.len,
-                .render = render,
-                .hl = hl,
+                .render = try self.alloc.alloc(u8, 0),
+                .hl = try self.alloc.alloc(Highlight, 0),
+                .syntax = self.syntax,
+                .idx = at,
+                .hl_open_comment = false,
             });
+
+            try self.rows.items[at].updateRender(self.alloc);
+            try self.rows.items[at].updateSyntax(&self.rows, self.alloc);
+
+            for (self.rows.items[at + 1 ..]) |*row| row.idx += 1;
 
             self.dirty = true;
         }
@@ -582,7 +721,8 @@ pub fn Editor(comptime WriterType: anytype) type {
                 if (self.dirty) "(modified)" else "",
             });
             defer self.alloc.free(status);
-            const rstatus = try std.fmt.allocPrint(self.alloc, "{d}/{d}", .{
+            const rstatus = try std.fmt.allocPrint(self.alloc, "{s} | {d}/{d}", .{
+                if (self.syntax) |syntax| syntax.filetype else "no ft",
                 self.cursor.row + 1,
                 self.rows.items.len,
             });
@@ -590,7 +730,7 @@ pub fn Editor(comptime WriterType: anytype) type {
 
             const len = @min(self.screen.col, status.len);
             try abuf.append(status[0..len]);
-            try abuf.appendN(" ", self.screen.col -| (len + rstatus.len + 1));
+            try abuf.appendN(" ", self.screen.col -| (len + rstatus.len));
             try abuf.append(rstatus);
 
             try abuf.append("\x1b[m\r\n");
@@ -616,7 +756,7 @@ pub fn Editor(comptime WriterType: anytype) type {
                                 '3' => .{ .editor_key = .delete },
                                 '5' => .{ .editor_key = .page_up },
                                 '6' => .{ .editor_key = .page_down },
-                                else => .{ .key = c },
+                                else => .{ .editor_key = .escape },
                             };
                     } else return switch (seq[1]) {
                         'A' => .{ .editor_key = .arrow_up },
@@ -625,13 +765,13 @@ pub fn Editor(comptime WriterType: anytype) type {
                         'D' => .{ .editor_key = .arrow_left },
                         'H' => .{ .editor_key = .home },
                         'F' => .{ .editor_key = .end },
-                        else => .{ .key = c },
+                        else => .{ .editor_key = .escape },
                     }
                 else if (seq[0] == 'O')
                     return switch (seq[1]) {
                         'H' => .{ .editor_key = .home },
                         'F' => .{ .editor_key = .end },
-                        else => .{ .key = c },
+                        else => .{ .editor_key = .escape },
                     };
             }
 
@@ -679,7 +819,16 @@ pub fn Editor(comptime WriterType: anytype) type {
                         var current_color: ?usize = null;
 
                         for (render, hls) |c, hl| {
-                            switch (hl) {
+                            if (std.ascii.isControl(c)) {
+                                const sym: u8 = if (c <= 26) '@' + c else '?';
+                                try abuf.append("\x1b[7m");
+                                try abuf.append(&.{sym});
+                                try abuf.append("\x1b[m");
+                                if (current_color) |cur_color| {
+                                    const buf = try std.fmt.allocPrint(arena_alloc, "\x1b[{d}m", .{cur_color});
+                                    try abuf.append(buf);
+                                }
+                            } else switch (hl) {
                                 .normal => {
                                     if (current_color != null) {
                                         try abuf.append("\x1b[39m");
@@ -770,6 +919,29 @@ pub fn Editor(comptime WriterType: anytype) type {
                 self.cursor.col = row_len;
             }
         }
+
+        fn selectSyntaxHighlight(self: *@This()) !void {
+            if (self.file_name == null) return;
+
+            const ext = fs.path.extension(self.file_name.?);
+
+            if (ext.len == 0) return;
+
+            inline for (&HLDB) |*entry| blk: {
+                inline for (entry.filematch) |match| {
+                    if (std.mem.eql(u8, ext, match)) {
+                        self.syntax = entry;
+
+                        for (self.rows.items) |*row| {
+                            self.alloc.free(row.hl);
+                            row.syntax = entry;
+                            try row.updateSyntax(&self.rows, self.alloc);
+                        }
+                        break :blk;
+                    }
+                }
+            }
+        }
     };
 }
 
@@ -808,23 +980,149 @@ const Abuf = struct {
     }
 };
 
+const EditorSyntax = struct {
+    filetype: []const u8,
+    filematch: []const []const u8,
+    singleline_comment_start: ?[]const u8,
+    multiline_comment: ?struct { start: []const u8, end: []const u8 },
+    keywords: []const []const u8,
+    types: []const []const u8,
+    flags: struct {
+        numbers: bool = false,
+        strings: bool = false,
+    },
+};
+
+const CSyntax: EditorSyntax = .{
+    .filetype = "c",
+    .filematch = &[_][]const u8{ ".c", ".h", ".cpp" },
+    .singleline_comment_start = "//",
+    .multiline_comment = .{ .start = "/*", .end = "*/" },
+    .keywords = &[_][]const u8{
+        "switch", "if",    "while",   "for",    "break", "continue", "return", "else",
+        "struct", "union", "typedef", "static", "enum",  "class",    "case",
+    },
+    .types = &[_][]const u8{
+        "int",      "long",   "double", "float", "char",
+        "unsigned", "signed", "void",
+    },
+    .flags = .{
+        .numbers = true,
+        .strings = true,
+    },
+};
+
+const ZigSyntax: EditorSyntax = .{
+    .filetype = "zig",
+    .filematch = &[_][]const u8{".zig"},
+    .singleline_comment_start = "//",
+    .multiline_comment = null,
+    .keywords = &[_][]const u8{
+        "addrspace", "align",       "allowzero", "and",   "anyframe",    "anytype",        "asm",         "async",     "await",    "break",
+        "callconv",  "catch",       "comptime",  "const", "continue",    "defer",          "else",        "enum",      "errdefer", "error",
+        "export",    "extern",      "fn",        "for",   "if",          "inline",         "noalias",     "nosuspend", "noinline", "opaque",
+        "or",        "orelse",      "packed",    "pub",   "resume",      "return",         "linksection", "struct",    "suspend",  "switch",
+        "test",      "threadlocal", "try",       "union", "unreachable", "usingnamespace", "var",         "volatile",  "while",
+    },
+    .types = &[_][]const u8{
+        "f16", "f32", "f64",   "f80",   "f128", "c_longdouble",
+        "i64", "u64", "isize", "usize", "i128", "ui128",
+    } ++ int: {
+        var ints: [64][]const u8 = undefined;
+        for (1..33) |i| {
+            const s = std.fmt.comptimePrint("{d}", .{i});
+            ints[i - 1] = "i" ++ s;
+            ints[i + 31] = "u" ++ s;
+        }
+        break :int ints;
+    },
+    .flags = .{
+        .numbers = true,
+        .strings = true,
+    },
+};
+const HLDB: [2]EditorSyntax = .{
+    CSyntax,
+    ZigSyntax,
+};
+
 test {
     _ = @import("term.zig");
 }
 
-test "hl" {
-    const hl = try ERow.updateSyntax("a11b22c33", std.testing.allocator);
-    defer std.testing.allocator.free(hl);
+test {
+    const str = "a11b22c33";
+
+    var row: ERow = .{
+        .chars = try std.testing.allocator.dupe(u8, str),
+        .render = try std.testing.allocator.alloc(u8, 0),
+        .hl = try std.testing.allocator.alloc(Highlight, 0),
+        .size = str.len,
+        .idx = 0,
+        .syntax = null,
+        .hl_open_comment = false,
+    };
+    defer row.deinit(std.testing.allocator);
+
+    try row.updateRender(std.testing.allocator);
+    try row.updateSyntax(null, std.testing.allocator);
 
     try std.testing.expectEqualSlices(Highlight, &[9]Highlight{
         .normal, // a
-        .number, // 1
-        .number, // 1
+        .normal, // 1
+        .normal, // 1
         .normal, // b
-        .number, // 2
-        .number, // 2
+        .normal, // 2
+        .normal, // 2
         .normal, // c
-        .number, // 3
-        .number, // 3
-    }, hl);
+        .normal, // 3
+        .normal, // 3
+    }, row.hl);
+}
+
+test {
+    const str = "100.";
+
+    var row: ERow = .{
+        .chars = try std.testing.allocator.dupe(u8, str),
+        .render = try std.testing.allocator.alloc(u8, 0),
+        .hl = try std.testing.allocator.alloc(Highlight, 0),
+        .size = str.len,
+        .idx = 0,
+        .syntax = &CSyntax,
+        .hl_open_comment = false,
+    };
+    defer row.deinit(std.testing.allocator);
+
+    try row.updateRender(std.testing.allocator);
+    try row.updateSyntax(null, std.testing.allocator);
+
+    try std.testing.expectEqualSlices(Highlight, &[4]Highlight{
+        .number, // 1
+        .number, // 0
+        .number, // 0
+        .number, // .
+    }, row.hl);
+}
+
+test "rx-cx-conversion" {
+    const str = "\tabc\tdefgsald;kjfsdlkfj\t\tsldkfjsldkfjsdl";
+
+    var row: ERow = .{
+        .chars = try std.testing.allocator.dupe(u8, str),
+        .render = try std.testing.allocator.alloc(u8, 0),
+        .hl = try std.testing.allocator.alloc(Highlight, 0),
+        .size = str.len,
+        .idx = 0,
+        .syntax = &CSyntax,
+        .hl_open_comment = false,
+    };
+    defer row.deinit(std.testing.allocator);
+
+    try row.updateRender(std.testing.allocator);
+    try row.updateSyntax(null, std.testing.allocator);
+
+    for (row.chars, 0..) |_, i| {
+        try std.testing.expectEqual(i, row.rxToCx(row.cxToRx(i)));
+    }
 }

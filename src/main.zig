@@ -34,8 +34,13 @@ pub fn main() !void {
     defer arg_iter.deinit();
 
     _ = arg_iter.next().?;
-    try if (arg_iter.next()) |file|
-        editor.open(file);
+    if (arg_iter.next()) |file|
+        editor.open(file) catch |e| switch (e) {
+            else => {
+                try stdout_writer.print("Error opening file {s}", .{file});
+                return;
+            },
+        };
 
     defer editor.close();
 
